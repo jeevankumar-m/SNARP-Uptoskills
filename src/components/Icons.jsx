@@ -9,8 +9,8 @@ export function LogoIcon({ className = "w-6 h-6" }) {
       <ellipse cx="16" cy="16" rx="10.5" ry="4" stroke="#ffffff" strokeWidth="1.8" strokeLinecap="round" transform="rotate(90 16 16)" opacity="0.9" />
       <defs>
         <linearGradient id="atomic-grad" x1="2" y1="2" x2="30" y2="30" gradientUnits="userSpaceOnUse">
-          <stop stopColor="#FF6B8B" />
-          <stop offset="1" stopColor="#FA4B6C" />
+          <stop stopColor="#38BDF8" />
+          <stop offset="1" stopColor="#0284C7" />
         </linearGradient>
       </defs>
     </svg>
