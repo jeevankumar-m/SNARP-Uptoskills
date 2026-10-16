@@ -20,22 +20,22 @@
   --warning: #f59e0b;
   --info: #0284c7;
 
-  /* Typography Colors */
-  --ink: #111827;
-  --ink-secondary: #374151;
-  --ink-soft: #64748b;
-  --ink-muted: #94a3b8;
+  /* Typography Colors (Dark Navy Theme) */
+  --ink: #ffffff;
+  --ink-secondary: #cbd5e1;
+  --ink-soft: #94a3b8;
+  --ink-muted: #64748b;
 
-  /* Surfaces & Backgrounds */
-  --bg-page: #f8f9fc;
-  --bg-surface: #ffffff;
-  --bg-subtle: #f1f4f9;
-  --bg-glass: rgba(255, 255, 255, 0.92);
+  /* Surfaces & Backgrounds (Exact Dark Navy Theme from Footer) */
+  --bg-page: #071328;
+  --bg-surface: #0b192e;
+  --bg-subtle: #0f2444;
+  --bg-glass: rgba(11, 25, 46, 0.92);
 
   /* Lines & Borders */
-  --line: #e2e8f0;
-  --line-light: #edf2f7;
-  --line-focus: #0284c7;
+  --line: #1e293b;
+  --line-light: #112240;
+  --line-focus: #38bdf8;
 
   /* Elevation Shadows */
   --shadow-xs: 0 1px 2px 0 rgba(16, 24, 40, 0.04);
