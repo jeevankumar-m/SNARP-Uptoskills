@@ -1,13 +1,34 @@
 import { useState, useEffect, useRef } from 'react'
 import { Link } from 'react-router-dom'
-import { Trash, Image as ImageIcon, X, ThumbsUp, ChatCircle, ShareFat } from '@phosphor-icons/react'
-import { api } from './api'
-import { Avatar } from './ui'
+import { Trash, Image as ImageIcon, X, ThumbsUp, ChatCircle, ShareFat, FilePdf } from '@phosphor-icons/react'
+import { api, apiBlob } from './api'
+import { Avatar } from './components/ui'
 import { ROLE_LABEL, timeAgo } from './format'
 import { COMMUNITIES, EVENTS } from './sample'
 
 const MAX = 5000
 const MAX_IMAGE = 5 * 1024 * 1024
+
+function FeedPaper({ paper }) {
+  const [pdfUrl, setPdfUrl] = useState('')
+  const [error, setError] = useState('')
+  useEffect(() => () => { if (pdfUrl) URL.revokeObjectURL(pdfUrl) }, [pdfUrl])
+  const openPdf = async () => {
+    try { setPdfUrl(URL.createObjectURL(await apiBlob(`/papers/${paper.id}/pdf`))); setError('') }
+    catch (err) { setError(err.message) }
+  }
+  const authors = (paper.authors ?? []).map((author) => typeof author === 'string' ? author : author.name).filter(Boolean)
+  return <>
+    <div className="article-meta"><span className="tag tag-blue">Research paper · {paper.domain}</span><time dateTime={paper.created_at}>{timeAgo(paper.created_at)}</time></div>
+    <h2 className="paper-feed-title">{paper.title}</h2>
+    <p className="article-authors">{authors.join(', ')}</p>
+    <p className="article-abstract">{paper.abstract}</p>
+    <div className="tag-row">{(paper.tags ?? []).map((tag) => <span key={tag} className="tag">#{tag}</span>)}</div>
+    <div className="post-actions"><button onClick={openPdf}><FilePdf size={18} /> View paper</button></div>
+    {error && <p className="field-error" role="alert">{error}</p>}
+    {pdfUrl && <div className="paper-pdf-preview"><button type="button" className="btn btn-ghost btn-sm" onClick={() => setPdfUrl('')}>Close PDF</button><iframe title={`PDF: ${paper.title}`} src={pdfUrl} /></div>}
+  </>
+}
 
 // ponytail: like/comment/share are UI only; like toggles locally and is not saved
 function PostActions() {
@@ -168,8 +189,9 @@ export default function Feed({ user, onLogout }) {
           )
         ) : (
           <ul className="post-stack">
-            {posts.map((p) => (
-              <li key={p.id} className="panel post">
+          {posts.map((p) => (
+              <li key={`${p.type ?? 'post'}-${p.id}`} className={`panel post ${p.type === 'paper' ? 'paper-feed-item' : ''}`}>
+                {p.type === 'paper' ? <FeedPaper paper={p} /> : <>
                 <Avatar name={p.author_name} />
                 <div className="post-main">
                   <div className="post-head">
@@ -201,6 +223,7 @@ export default function Feed({ user, onLogout }) {
                   )}
                   <PostActions />
                 </div>
+                </>}
               </li>
             ))}
           </ul>

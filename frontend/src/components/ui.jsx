@@ -1,4 +1,4 @@
-import { initials, colorFor } from './format'
+import { initials, colorFor } from '../format'
 
 export function Avatar({ name, size = '' }) {
   return <div className={`avatar avatar-${colorFor(name)} ${size && `avatar-${size}`}`}>{initials(name)}</div>

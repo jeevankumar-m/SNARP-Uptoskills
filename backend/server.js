@@ -6,10 +6,15 @@ import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 import multer from 'multer'
 import { sniffImage } from './image.js'
+import { DEFAULT_MAX_PDF_BYTES, validatePaperSubmission } from './paper.js'
 
 // Connection settings come from the standard PG* env vars (PGHOST, PGPORT, PGUSER, PGPASSWORD), see .env.example
 const DB_NAME = process.env.PGDATABASE || 'snarp'
 const PORT = process.env.PORT || 5000
+const configuredMaxPdfBytes = Number(process.env.PAPER_MAX_PDF_BYTES || '')
+const MAX_PDF_BYTES = Number.isSafeInteger(configuredMaxPdfBytes) && configuredMaxPdfBytes > 0
+  ? Math.min(configuredMaxPdfBytes, DEFAULT_MAX_PDF_BYTES)
+  : DEFAULT_MAX_PDF_BYTES
 
 // First run: generate a JWT secret and save it so logins survive restarts
 if (!process.env.JWT_SECRET) {
@@ -62,7 +67,31 @@ async function setupDb() {
       ALTER TABLE posts ADD CONSTRAINT posts_content_check
         CHECK (length(body) <= 5000 AND (length(trim(body)) > 0 OR image_id IS NOT NULL));
     EXCEPTION WHEN duplicate_object THEN NULL;
-    END $$;`)
+    END $$;
+    CREATE TABLE IF NOT EXISTS papers (
+      id                 BIGSERIAL PRIMARY KEY,
+      user_id            INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      title              VARCHAR(300) NOT NULL,
+      abstract           TEXT NOT NULL,
+      doi                VARCHAR(255),
+      domain             VARCHAR(120) NOT NULL,
+      tags               TEXT[] NOT NULL DEFAULT '{}',
+      authors            JSONB NOT NULL,
+      pdf_data           BYTEA NOT NULL,
+      pdf_filename       VARCHAR(255) NOT NULL,
+      pdf_content_type   VARCHAR(100) NOT NULL DEFAULT 'application/pdf' CHECK (pdf_content_type = 'application/pdf'),
+      pdf_size           INTEGER NOT NULL CHECK (pdf_size > 0 AND pdf_size <= 10485760),
+      additional_notes   TEXT,
+      status             VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+      idempotency_key    UUID,
+      created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (user_id, idempotency_key)
+    );
+    ALTER TABLE papers ADD COLUMN IF NOT EXISTS reviewed_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
+    ALTER TABLE papers ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;
+    ALTER TABLE papers ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
+    CREATE INDEX IF NOT EXISTS papers_status_created_at_idx ON papers (status, created_at DESC);`)
   return pool
 }
 
@@ -75,6 +104,7 @@ const app = express()
 app.use(express.json({ limit: '100kb' }))
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, files: 1 } })
+const paperUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_PDF_BYTES, files: 1 } })
 
 const publicUser = ({ id, name, email, role, created_at }) => ({ id, name, email, role, created_at })
 const issue = (user) => ({ token: jwt.sign({ sub: user.id }, JWT_SECRET, { expiresIn: '7d' }), user: publicUser(user) })
@@ -86,6 +116,17 @@ function auth(req, res, next) {
     next()
   } catch {
     res.status(401).json({ error: 'Please log in again' })
+  }
+}
+
+async function requireModerator(req, res, next) {
+  try {
+    const { rows } = await pool.query('SELECT role FROM users WHERE id = $1', [req.userId])
+    if (!['admin', 'moderator'].includes(rows[0]?.role)) return res.status(403).json({ error: 'Moderator or Admin access required' })
+    req.userRole = rows[0].role
+    next()
+  } catch (err) {
+    next(err)
   }
 }
 
@@ -136,9 +177,36 @@ const POST_SELECT = `
   SELECT p.id, p.body, p.image_id, p.created_at, p.user_id, u.name AS author_name, u.role AS author_role
   FROM posts p JOIN users u ON u.id = p.user_id`
 
-// ponytail: latest 50 only, add ?before=<id> pagination when the feed outgrows it
+// Mixed feed: social posts plus approved papers, newest first. Paper metadata is always read from PostgreSQL.
 app.get('/api/posts', auth, async (req, res) => {
-  const { rows } = await pool.query(`${POST_SELECT} ORDER BY p.created_at DESC LIMIT 50`)
+  const { rows } = await pool.query(`
+    SELECT * FROM (
+      SELECT 'post'::text AS type, p.id::text AS id, p.body, p.image_id::text AS image_id,
+        p.created_at, p.user_id, u.name AS author_name, u.role AS author_role,
+        NULL::text AS title, NULL::text AS abstract, NULL::jsonb AS authors,
+        NULL::text AS domain, NULL::text[] AS tags, NULL::text AS doi
+      FROM posts p JOIN users u ON u.id = p.user_id
+      UNION ALL
+      SELECT 'paper'::text AS type, rp.id::text AS id, NULL::text AS body, NULL::text AS image_id,
+        COALESCE(rp.reviewed_at, rp.created_at) AS created_at, rp.user_id, u.name AS author_name, u.role AS author_role,
+        rp.title, rp.abstract, rp.authors, rp.domain, rp.tags, rp.doi
+      FROM papers rp JOIN users u ON u.id = rp.user_id
+      WHERE rp.status = 'approved'
+    ) feed ORDER BY created_at DESC LIMIT 50`)
+  res.json(rows)
+})
+
+app.get('/api/papers/search', auth, async (req, res) => {
+  const q = String(req.query.q ?? '').trim().slice(0, 200)
+  const pattern = `%${q.replace(/[\\%_]/g, '\\$&')}%`
+  const { rows } = await pool.query(`
+    SELECT p.id, p.title, p.abstract, p.domain, p.tags, p.authors, p.doi,
+      p.reviewed_at, p.created_at, u.name AS submitter_name
+    FROM papers p JOIN users u ON u.id = p.user_id
+    WHERE p.status = 'approved'
+      AND (p.title ILIKE $1 OR p.abstract ILIKE $1 OR p.domain ILIKE $1 OR p.doi ILIKE $1
+        OR array_to_string(p.tags, ' ') ILIKE $1 OR p.authors::text ILIKE $1)
+    ORDER BY COALESCE(p.reviewed_at, p.created_at) DESC LIMIT 50`, [pattern])
   res.json(rows)
 })
 
@@ -158,6 +226,161 @@ app.post('/api/posts', auth, upload.single('image'), async (req, res) => {
   )
   const created = await pool.query(`${POST_SELECT} WHERE p.id = $1`, [rows[0].id])
   res.status(201).json(created.rows[0])
+})
+
+app.post('/api/papers/submit', auth, paperUpload.single('pdf'), async (req, res) => {
+  const idempotencyKey = req.get('Idempotency-Key') || null
+  if (idempotencyKey && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(idempotencyKey)) {
+    return res.status(400).json({ error: 'Invalid Idempotency-Key' })
+  }
+
+  let paper
+  try {
+    paper = validatePaperSubmission(req.body ?? {}, req.file, MAX_PDF_BYTES)
+  } catch (err) {
+    if (err.field) return res.status(400).json({ error: err.message, field: err.field })
+    throw err
+  }
+
+  const inserted = await pool.query(
+    `INSERT INTO papers
+       (user_id, title, abstract, doi, domain, tags, authors, pdf_data, pdf_filename,
+        pdf_content_type, pdf_size, additional_notes, idempotency_key)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, 'application/pdf', $10, $11, $12)
+     ON CONFLICT (user_id, idempotency_key) DO NOTHING
+     RETURNING id, title, status, created_at`,
+    [
+      req.userId,
+      paper.title,
+      paper.abstract,
+      paper.doi,
+      paper.domain,
+      paper.tags,
+      JSON.stringify(paper.authors),
+      paper.pdfData,
+      paper.filename,
+      paper.pdfSize,
+      paper.additionalNotes,
+      idempotencyKey,
+    ]
+  )
+
+  let result = inserted.rows[0]
+  let statusCode = 201
+  if (!result && idempotencyKey) {
+    const existing = await pool.query(
+      'SELECT id, title, status, created_at FROM papers WHERE user_id = $1 AND idempotency_key = $2',
+      [req.userId, idempotencyKey]
+    )
+    result = existing.rows[0]
+    statusCode = 200
+  }
+  if (!result) throw new Error('Paper submission could not be confirmed')
+
+  res.status(statusCode).json({ id: result.id, title: result.title, status: result.status, submittedAt: result.created_at })
+})
+
+app.get('/api/papers/my-submissions', auth, async (req, res) => {
+  const { rows } = await pool.query(`
+    SELECT id, title, abstract, doi, domain, tags, authors, pdf_filename, pdf_size,
+      status, rejection_reason, reviewed_at, created_at
+    FROM papers WHERE user_id = $1 ORDER BY created_at DESC`, [req.userId])
+  res.json(rows)
+})
+
+app.get('/api/moderation/papers', auth, requireModerator, async (req, res) => {
+  const status = String(req.query.status ?? 'pending')
+  if (!['pending', 'approved', 'rejected', 'reviewed'].includes(status)) {
+    return res.status(400).json({ error: 'Status must be pending, approved, rejected, or reviewed' })
+  }
+  const page = Math.max(1, Math.min(10000, Number.parseInt(req.query.page, 10) || 1))
+  const limit = Math.max(1, Math.min(50, Number.parseInt(req.query.limit, 10) || 20))
+  const where = status === 'reviewed' ? "p.status IN ('approved', 'rejected')" : 'p.status = $1'
+  const params = status === 'reviewed' ? [limit, (page - 1) * limit] : [status, limit, (page - 1) * limit]
+  const limitParam = status === 'reviewed' ? '$1' : '$2'
+  const offsetParam = status === 'reviewed' ? '$2' : '$3'
+  const countParams = status === 'reviewed' ? [] : [status]
+  const countWhere = status === 'reviewed' ? "status IN ('approved', 'rejected')" : 'status = $1'
+  const [{ rows }, countResult] = await Promise.all([
+    pool.query(`SELECT p.id, p.title, p.abstract, p.doi, p.domain, p.tags, p.authors, p.status,
+      p.created_at, p.reviewed_at, p.rejection_reason, submitter.name AS submitter_name,
+      submitter.email AS submitter_email, reviewer.name AS reviewer_name
+      FROM papers p JOIN users submitter ON submitter.id = p.user_id
+      LEFT JOIN users reviewer ON reviewer.id = p.reviewed_by
+      WHERE ${where} ORDER BY COALESCE(p.reviewed_at, p.created_at) DESC
+      LIMIT ${limitParam} OFFSET ${offsetParam}`, params),
+    pool.query(`SELECT count(*)::int AS total FROM papers WHERE ${countWhere}`, countParams),
+  ])
+  res.json({ papers: rows, page, limit, total: countResult.rows[0].total })
+})
+
+app.get('/api/moderation/papers/:id', auth, requireModerator, async (req, res) => {
+  if (!/^\d+$/.test(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  const { rows } = await pool.query(`
+    SELECT p.id, p.title, p.abstract, p.doi, p.domain, p.tags, p.authors, p.pdf_filename,
+      p.pdf_size, p.additional_notes, p.status, p.rejection_reason, p.created_at, p.reviewed_at,
+      submitter.name AS submitter_name, submitter.email AS submitter_email,
+      reviewer.name AS reviewer_name
+    FROM papers p JOIN users submitter ON submitter.id = p.user_id
+    LEFT JOIN users reviewer ON reviewer.id = p.reviewed_by WHERE p.id = $1`, [req.params.id])
+  if (!rows[0]) return res.status(404).json({ error: 'Paper not found' })
+  res.json(rows[0])
+})
+
+app.patch('/api/moderation/papers/:id/approve', auth, requireModerator, async (req, res) => {
+  if (!/^\d+$/.test(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  const { rows } = await pool.query(`UPDATE papers SET status = 'approved', reviewed_by = $2,
+    reviewed_at = now(), rejection_reason = NULL, updated_at = now()
+    WHERE id = $1 AND status = 'pending' RETURNING id, status, reviewed_by, reviewed_at`, [req.params.id, req.userId])
+  if (!rows[0]) {
+    const exists = await pool.query('SELECT 1 FROM papers WHERE id = $1', [req.params.id])
+    return res.status(exists.rowCount ? 409 : 404).json({ error: exists.rowCount ? 'Paper has already been reviewed' : 'Paper not found' })
+  }
+  res.json(rows[0])
+})
+
+app.patch('/api/moderation/papers/:id/reject', auth, requireModerator, async (req, res) => {
+  if (!/^\d+$/.test(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : ''
+  if (reason.length < 5 || reason.length > 2000) return res.status(400).json({ error: 'Rejection reason must be 5 to 2,000 characters', field: 'reason' })
+  const { rows } = await pool.query(`UPDATE papers SET status = 'rejected', reviewed_by = $2,
+    reviewed_at = now(), rejection_reason = $3, updated_at = now()
+    WHERE id = $1 AND status = 'pending' RETURNING id, status, reviewed_by, reviewed_at, rejection_reason`,
+  [req.params.id, req.userId, reason])
+  if (!rows[0]) {
+    const exists = await pool.query('SELECT 1 FROM papers WHERE id = $1', [req.params.id])
+    return res.status(exists.rowCount ? 409 : 404).json({ error: exists.rowCount ? 'Paper has already been reviewed' : 'Paper not found' })
+  }
+  res.json(rows[0])
+})
+
+app.get('/api/papers/:id/pdf', auth, async (req, res) => {
+  if (!/^\d+$/.test(req.params.id)) return res.status(404).json({ error: 'Paper not found' })
+  const { rows } = await pool.query(
+    'SELECT id, user_id, status, pdf_data, pdf_filename FROM papers WHERE id = $1',
+    [req.params.id]
+  )
+  const paper = rows[0]
+  if (!paper) return res.status(404).json({ error: 'Paper not found' })
+
+  if (String(paper.user_id) !== String(req.userId) && paper.status !== 'approved') {
+    const { rows: userRows } = await pool.query('SELECT role FROM users WHERE id = $1', [req.userId])
+    if (!['admin', 'moderator'].includes(userRows[0]?.role)) {
+      return res.status(404).json({ error: 'Paper not found' })
+    }
+  }
+
+  const filename = paper.pdf_filename.replace(/[\r\n"\\]/g, '_')
+  const asciiFilename = filename.replace(/[^\x20-\x7E]/g, '_')
+  const encodedFilename = encodeURIComponent(filename).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)
+  res.set({
+    'Content-Type': 'application/pdf',
+    'Content-Length': String(paper.pdf_data.length),
+    'Content-Disposition': `inline; filename="${asciiFilename}"; filename*=UTF-8''${encodedFilename}`,
+    'Cache-Control': 'private, no-store',
+    'X-Content-Type-Options': 'nosniff',
+  })
+  res.send(paper.pdf_data)
 })
 
 app.delete('/api/posts/:id', auth, async (req, res) => {
@@ -186,7 +409,10 @@ app.get('/api/images/:id', async (req, res) => {
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, _next) => {
   if (err instanceof multer.MulterError) {
-    return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'Image must be 5 MB or smaller' : err.message })
+    const error = err.code === 'LIMIT_FILE_SIZE'
+      ? (err.field === 'pdf' ? `PDF must be ${Math.floor(MAX_PDF_BYTES / 1024 / 1024)} MB or smaller` : 'Image must be 5 MB or smaller')
+      : err.message
+    return res.status(400).json({ error, ...(err.field === 'pdf' ? { field: 'pdf' } : {}) })
   }
   console.error(err)
   res.status(err.status || 500).json({ error: err.status ? err.message : 'Server error' })

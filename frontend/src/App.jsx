@@ -20,6 +20,7 @@ import {
   Tools,
   Submit,
   Moderation,
+  MySubmissions,
   Settings,
   Help,
   Search,
@@ -94,8 +95,9 @@ export default function App() {
             <Route path="/messages" element={<Messages />} />
             <Route path="/notifications" element={<Notifications />} />
             <Route path="/tools" element={<Tools />} />
-            <Route path="/submit" element={<Submit />} />
-            <Route path="/moderation" element={<Moderation />} />
+            <Route path="/submit" element={<Submit user={user} />} />
+            <Route path="/moderation" element={<Moderation user={user} />} />
+            <Route path="/my-submissions" element={<MySubmissions />} />
 
             <Route
               path="/settings"

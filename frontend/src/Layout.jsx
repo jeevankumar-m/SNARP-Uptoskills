@@ -4,7 +4,7 @@ import {
   House, UsersThree, Article, CalendarBlank, ChatCircleDots, Bell, Quotes,
   UploadSimple, ShieldCheck, GearSix, Question, SignOut, List, X, MagnifyingGlass, Plus,
 } from '@phosphor-icons/react'
-import { Avatar } from './ui'
+import { Avatar } from './components/ui'
 import { ROLE_LABEL } from './format'
 import { CONVERSATIONS, NOTIFICATIONS } from './sample'
 import logo from './assets/logo.png'
@@ -21,7 +21,7 @@ const MAIN_NAV = [
 
 const WORK_NAV = [
   { to: '/submit', label: 'Submit a paper', icon: UploadSimple },
-  { to: '/moderation', label: 'Moderation', icon: ShieldCheck },
+  { to: '/my-submissions', label: 'My submissions', icon: Article },
   { to: '/settings', label: 'Settings', icon: GearSix },
   { to: '/help', label: 'Help center', icon: Question },
 ]
@@ -68,6 +68,7 @@ export default function Layout({ user, onLogout }) {
         <div className="sidebar-scroll">
           <NavGroup title="Discover" items={MAIN_NAV} onNavigate={close} />
           <NavGroup title="Workspace" items={WORK_NAV} onNavigate={close} />
+          {['admin', 'moderator'].includes(user.role) && <NavGroup title="Review" items={[{ to: '/moderation', label: 'Paper moderation', icon: ShieldCheck }]} onNavigate={close} />}
         </div>
 
         <div className="sidebar-user">
